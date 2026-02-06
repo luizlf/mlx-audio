@@ -68,6 +68,38 @@ def parse_args():
         help="Stream the transcription as it is generated (default: False)",
     )
     parser.add_argument(
+        "--stream-strategy",
+        type=str,
+        default="stable",
+        choices=["stable", "realtime"],
+        help="Streaming strategy for supported models (default: stable)",
+    )
+    parser.add_argument(
+        "--stream-refresh-reads",
+        type=int,
+        default=50,
+        help="Stable streaming refresh cadence in buffer reads (default: 50)",
+    )
+    parser.add_argument(
+        "--realtime-carry-policy",
+        type=str,
+        default="exact",
+        choices=["exact", "lexical"],
+        help="Realtime streaming carry policy for supported models (default: exact)",
+    )
+    parser.add_argument(
+        "--realtime-auto-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable auto fallback from realtime to stable streaming (default: True)",
+    )
+    parser.add_argument(
+        "--realtime-fallback-refresh-reads",
+        type=int,
+        default=50,
+        help="Stable refresh cadence when realtime fallback is enabled (default: 50)",
+    )
+    parser.add_argument(
         "--context",
         type=str,
         default=None,
@@ -306,6 +338,17 @@ def generate_transcription(
         prompt_tokens = 0
         generation_tokens = 0
         for result in model.generate(audio, verbose=verbose, **kwargs):
+            if isinstance(result, str):
+                segment_dict = {
+                    "text": result,
+                    "start": None,
+                    "end": None,
+                    "is_final": False,
+                }
+                all_segments.append(segment_dict)
+                accumulated_text += result
+                continue
+
             segment_dict = {
                 "text": result.text,
                 "start": result.start_time,
