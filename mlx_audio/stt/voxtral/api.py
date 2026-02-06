@@ -174,9 +174,6 @@ class VoxtralRealtime:
             )
         if realtime_fallback_refresh_reads <= 0:
             raise ValueError("realtime_fallback_refresh_reads must be > 0")
-        if strategy == "realtime" and realtime_auto_fallback:
-            strategy = "stable"
-            offline_refresh_reads = realtime_fallback_refresh_reads
 
         if strategy == "stable":
             if offline_refresh_reads <= 0:

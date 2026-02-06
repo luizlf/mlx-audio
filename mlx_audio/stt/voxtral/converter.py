@@ -4,7 +4,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import mlx.core as mx
 from huggingface_hub import snapshot_download
@@ -230,6 +230,12 @@ def _maybe_permute_rope(name: str, value: mx.array, text_cfg: TextConfig) -> mx.
     return value
 
 
+def _build_output_config(config: VoxtralConfig) -> Dict[str, Any]:
+    output = dict(config.raw)
+    output["model_type"] = "voxtral"
+    return output
+
+
 def convert_to_mlx(model_id_or_path: str, output_dir: str, revision: str | None = None) -> Path:
     config, _ = VoxtralConfig.from_pretrained(model_id_or_path, revision=revision)
     model = VoxtralModel(config.text, config.audio)
@@ -242,7 +248,7 @@ def convert_to_mlx(model_id_or_path: str, output_dir: str, revision: str | None 
     out.mkdir(parents=True, exist_ok=True)
     mx.save_safetensors(str(out / "model.safetensors"), weights)
     with (out / "config.json").open("w", encoding="utf-8") as f:
-        json.dump(config.raw, f, indent=2)
+        json.dump(_build_output_config(config), f, indent=2)
     return out
 
 

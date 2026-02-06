@@ -7,8 +7,10 @@ import pytest
 pytest.importorskip("mistral_common")
 
 from mlx_audio.stt.models.voxtral.config import ModelConfig
+from mlx_audio.stt.voxtral import api as voxtral_api
 from mlx_audio.stt.voxtral.api import _replace_audio_placeholders, _should_fallback_realtime
-from mlx_audio.stt.voxtral.config import VoxtralConfig
+from mlx_audio.stt.voxtral.config import AudioConfig, TextConfig, VoxtralConfig
+from mlx_audio.stt.voxtral.converter import _build_output_config
 
 
 def test_replace_audio_placeholders_replaces_only_audio_tokens() -> None:
@@ -125,6 +127,93 @@ def test_should_fallback_realtime_keeps_varied_tokens() -> None:
     assert not _should_fallback_realtime(recent, {32, 33, 34})
 
 
+def test_stream_transcribe_realtime_stays_realtime_before_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _DummyBuffer:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self._pending = []
+
+        def write(self, chunk: np.ndarray) -> None:
+            self._pending.append(chunk)
+
+        def read(self):
+            if self._pending:
+                return self._pending.pop(0)
+            return None
+
+    monkeypatch.setattr(voxtral_api, "StreamingBuffer", _DummyBuffer)
+    monkeypatch.setattr("mlx_lm.models.cache.make_prompt_cache", lambda _model: None)
+
+    runtime = object.__new__(voxtral_api.VoxtralRealtime)
+    audio_cfg = type(
+        "_AudioCfg",
+        (),
+        {
+            "sampling_rate": 16000,
+            "frame_rate": 50,
+            "transcription_delay_ms": 0.0,
+            "streaming_look_ahead_ms": 0.0,
+            "streaming_look_back_ms": 0.0,
+        },
+    )()
+    runtime.tokenizer = type(
+        "_Tokenizer",
+        (),
+        {
+            "instruct_tokenizer": type(
+                "_InstructTokenizer",
+                (),
+                {"audio_encoder": type("_AudioEncoder", (), {"audio_config": audio_cfg})()},
+            )()
+        },
+    )()
+    runtime.model = object()
+    runtime._stream_control_token_ids = {32, 33, 34}
+    runtime._decode_policy = None
+
+    prepare_calls = {"count": 0}
+    transcribe_calls = {"count": 0}
+
+    def _prepare_inputs(audio, language, streaming_mode=None):
+        del language, streaming_mode
+        prepare_calls["count"] += 1
+        return mx.array([7], dtype=mx.int32), [audio.astype(np.float32)]
+
+    def _prepare_audio_conv_features(audio_arrays, **kwargs):
+        del audio_arrays, kwargs
+        return mx.zeros((1, 1, 1), dtype=mx.float32)
+
+    def _generate_audio_conditioned(*args, **kwargs):
+        del args, kwargs
+        return []
+
+    def _transcribe(audio, language="en", max_tokens=256):
+        del audio, language, max_tokens
+        transcribe_calls["count"] += 1
+        return voxtral_api.STTOutput(text="final transcript", prompt_tokens=0, generation_tokens=0)
+
+    runtime._prepare_inputs = _prepare_inputs
+    runtime._prepare_audio_conv_features = _prepare_audio_conv_features
+    runtime._generate_audio_conditioned = _generate_audio_conditioned
+    runtime.transcribe = _transcribe
+
+    chunks = [np.ones(320, dtype=np.float32) for _ in range(3)]
+    list(
+        runtime.stream_transcribe(
+            chunks,
+            strategy="realtime",
+            offline_refresh_reads=1,
+            realtime_auto_fallback=True,
+            realtime_fallback_refresh_reads=1,
+        )
+    )
+
+    assert prepare_calls["count"] > 0
+    assert transcribe_calls["count"] == 1
+
+
 def test_voxtral_config_from_multimodal_dict() -> None:
     cfg = {
         "hidden_size": 3072,
@@ -162,6 +251,51 @@ def test_voxtral_config_from_multimodal_dict() -> None:
     assert vox.audio.num_mel_bins == 80
     assert vox.audio.is_causal is True
     assert vox.text.hidden_size == 3072
+
+
+def test_voxtral_config_remaps_legacy_split_audio_config() -> None:
+    cfg = {
+        "model_type": "voxtral",
+        "text_config": {
+            "hidden_size": 3072,
+            "num_hidden_layers": 30,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "intermediate_size": 8192,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 131072,
+        },
+        "audio_config": {
+            "hidden_size": 1280,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 20,
+            "intermediate_size": 5120,
+            "num_mel_bins": 128,
+            "max_source_positions": 1500,
+        },
+    }
+
+    vox = VoxtralConfig.from_dict(cfg)
+    assert vox.audio.d_model == 1280
+    assert vox.audio.encoder_layers == 32
+    assert vox.audio.encoder_ffn_dim == 5120
+    assert vox.audio.encoder_attention_heads == 20
+    assert vox.audio.sampling_rate == 16000
+    assert vox.audio.hop_length == 160
+    assert vox.audio.window_size == 400
+
+
+def test_converter_output_config_forces_voxtral_model_type() -> None:
+    cfg = VoxtralConfig(
+        text=TextConfig({"hidden_size": 1, "vocab_size": 1}),
+        audio=AudioConfig({}),
+        raw={"foo": "bar", "model_type": "mistral"},
+    )
+
+    out_cfg = _build_output_config(cfg)
+    assert out_cfg["model_type"] == "voxtral"
+    assert out_cfg["foo"] == "bar"
+    assert cfg.raw["model_type"] == "mistral"
 
 
 def test_model_config_wraps_runtime_config() -> None:

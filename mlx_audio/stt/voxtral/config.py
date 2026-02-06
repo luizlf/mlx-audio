@@ -209,13 +209,144 @@ def _resolve_config_path(path: Path) -> Path:
 def _split_config(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     # If already split
     if "text_config" in cfg and "audio_config" in cfg:
-        return cfg["text_config"], cfg["audio_config"]
+        return _remap_split_configs(cfg)
 
     # Mistral multimodal format
     if "multimodal" in cfg and "whisper_model_args" in cfg["multimodal"]:
         return _remap_mistral_audio_args(cfg)
 
     raise ValueError("Unsupported Voxtral config format. Expected multimodal or audio/text config.")
+
+
+def _first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _remap_split_configs(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    text_cfg = _normalize_split_text_config(cfg["text_config"])
+    audio_cfg = _normalize_split_audio_config(cfg["audio_config"])
+    return text_cfg, audio_cfg
+
+
+def _normalize_split_text_config(text_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    remapped = dict(text_cfg)
+
+    alias_pairs = (
+        ("hidden_size", ("hidden_size", "dim")),
+        ("num_hidden_layers", ("num_hidden_layers", "n_layers")),
+        ("num_attention_heads", ("num_attention_heads", "n_heads")),
+        ("num_key_value_heads", ("num_key_value_heads", "n_kv_heads")),
+        ("intermediate_size", ("intermediate_size", "hidden_dim")),
+        ("rms_norm_eps", ("rms_norm_eps", "norm_eps")),
+        ("max_position_embeddings", ("max_position_embeddings", "model_max_length")),
+        ("tie_word_embeddings", ("tie_word_embeddings", "tied_embeddings")),
+    )
+    for out_key, in_keys in alias_pairs:
+        value = _first_not_none(*(remapped.get(k) for k in in_keys))
+        if value is not None:
+            remapped[out_key] = value
+
+    if remapped.get("num_key_value_heads") is None:
+        remapped["num_key_value_heads"] = remapped.get("num_attention_heads")
+
+    return remapped
+
+
+def _normalize_split_audio_config(audio_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    remapped = dict(audio_cfg)
+    encoding_args = remapped.get("audio_encoding_args")
+    if not isinstance(encoding_args, dict):
+        encoding_args = {}
+
+    window_size = _first_not_none(
+        remapped.get("window_size"),
+        encoding_args.get("window_size"),
+        400,
+    )
+
+    normalized = {
+        "num_mel_bins": _first_not_none(
+            remapped.get("num_mel_bins"),
+            encoding_args.get("num_mel_bins"),
+            128,
+        ),
+        "window_size": window_size,
+        "n_fft": _first_not_none(
+            remapped.get("n_fft"),
+            encoding_args.get("n_fft"),
+            window_size,
+        ),
+        "sampling_rate": _first_not_none(
+            remapped.get("sampling_rate"),
+            encoding_args.get("sampling_rate"),
+            16000,
+        ),
+        "hop_length": _first_not_none(
+            remapped.get("hop_length"),
+            encoding_args.get("hop_length"),
+            160,
+        ),
+        "downsample_factor": _first_not_none(remapped.get("downsample_factor"), 2),
+        "d_model": _first_not_none(
+            remapped.get("d_model"),
+            remapped.get("hidden_size"),
+            remapped.get("dim"),
+        ),
+        "encoder_layers": _first_not_none(
+            remapped.get("encoder_layers"),
+            remapped.get("num_hidden_layers"),
+            remapped.get("n_layers"),
+        ),
+        "encoder_ffn_dim": _first_not_none(
+            remapped.get("encoder_ffn_dim"),
+            remapped.get("intermediate_size"),
+            remapped.get("hidden_dim"),
+        ),
+        "encoder_attention_heads": _first_not_none(
+            remapped.get("encoder_attention_heads"),
+            remapped.get("num_attention_heads"),
+            remapped.get("n_heads"),
+        ),
+        "encoder_head_dim": _first_not_none(
+            remapped.get("encoder_head_dim"),
+            remapped.get("head_dim"),
+        ),
+        "vocab_size": remapped.get("vocab_size"),
+        "max_source_positions": _first_not_none(remapped.get("max_source_positions"), 1500),
+        "is_causal": _first_not_none(remapped.get("is_causal"), remapped.get("causal"), False),
+        "sliding_window": remapped.get("sliding_window"),
+        "block_pool_size": _first_not_none(remapped.get("block_pool_size"), 1),
+        "pos_embed": _first_not_none(remapped.get("pos_embed"), "sinusoidal"),
+        "global_log_mel_max": _first_not_none(
+            remapped.get("global_log_mel_max"),
+            encoding_args.get("global_log_mel_max"),
+        ),
+        "max_position_embeddings": remapped.get("max_position_embeddings"),
+    }
+
+    remapped.update({k: v for k, v in normalized.items() if v is not None})
+
+    required_keys = (
+        "num_mel_bins",
+        "window_size",
+        "sampling_rate",
+        "hop_length",
+        "d_model",
+        "encoder_layers",
+        "encoder_ffn_dim",
+        "encoder_attention_heads",
+    )
+    missing = [key for key in required_keys if remapped.get(key) is None]
+    if missing:
+        raise ValueError(
+            "Unsupported split Voxtral audio_config: missing required keys after remapping: "
+            + ", ".join(missing)
+        )
+
+    return remapped
 
 
 def _remap_mistral_audio_args(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
