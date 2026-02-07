@@ -225,11 +225,14 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
 
 def load_config(model_path: Path) -> dict:
     """Load model configuration from a path."""
-    config_path = model_path / "config.json"
-    if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    raise FileNotFoundError(f"Config not found at {model_path}")
+    for config_name in ("config.json", "params.json"):
+        config_path = model_path / config_name
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    raise FileNotFoundError(
+        f"Config not found at {model_path} (expected config.json or params.json)"
+    )
 
 
 def _match_by_model_type(model_type: str) -> Optional[Domain]:

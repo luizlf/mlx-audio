@@ -161,17 +161,20 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         dict: Model configuration
 
     Raises:
-        FileNotFoundError: If config.json is not found at the path
+        FileNotFoundError: If neither config.json nor params.json is found at the path
     """
     if isinstance(model_path, str):
         model_path = get_model_path(model_path, **kwargs)
 
-    config_file = model_path / "config.json"
-    if config_file.exists():
-        with open(config_file, encoding="utf-8") as f:
-            return json.load(f)
-    else:
-        raise FileNotFoundError(f"Config not found at {model_path}")
+    for config_name in ("config.json", "params.json"):
+        config_file = model_path / config_name
+        if config_file.exists():
+            with open(config_file, encoding="utf-8") as f:
+                return json.load(f)
+
+    raise FileNotFoundError(
+        f"Config not found at {model_path} (expected config.json or params.json)"
+    )
 
 
 def load_weights(model_path: Path) -> dict:
