@@ -8,7 +8,7 @@ from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from huggingface_hub import snapshot_download
+from mlx_audio.utils import get_model_path
 
 try:
     from mistral_common.audio import Audio
@@ -29,7 +29,6 @@ except ImportError:
 
 from .audio import StreamingBuffer, compute_log_mel
 from .config import VoxtralConfig
-from .converter import align_weights, remap_weights
 from .model import VoxtralModel
 
 
@@ -110,21 +109,49 @@ class VoxtralRealtime:
         quantize_group_size: int = 32,
         revision: Optional[str] = None,
     ) -> "VoxtralRealtime":
-        config, cache_dir = VoxtralConfig.from_pretrained(model_id_or_path, revision=revision)
-        tokenizer = load_tokenizer(model_id_or_path, revision=revision)
-        model = VoxtralModel(config.text, config.audio)
+        from mlx_audio.stt.utils import load as load_stt_model
 
-        weights = _load_or_convert_weights(model_id_or_path, cache_dir, revision=revision)
-        weights = remap_weights(weights, text_cfg=config.text)
-        weights = align_weights(model, weights)
-        model.load_weights(list(weights.items()), strict=False)
-        _maybe_cast_model(model, dtype)
-        _maybe_quantize_model(
-            model,
-            bits=quantize_bits,
-            group_size=quantize_group_size,
-        )
-        return cls(model=model, tokenizer=tokenizer, config=config)
+        model = load_stt_model(model_id_or_path, revision=revision)
+        if not isinstance(model, VoxtralModel):
+            raise TypeError(
+                f"Expected a VoxtralRealtime-compatible model, got {type(model).__name__}"
+            )
+
+        needs_runtime_refresh = False
+        if dtype != "fp16" or quantize_bits is not None:
+            _maybe_cast_model(model, dtype)
+            needs_runtime_refresh = True
+        if quantize_bits is not None:
+            _maybe_quantize_model(
+                model,
+                bits=quantize_bits,
+                group_size=quantize_group_size,
+            )
+            needs_runtime_refresh = True
+
+        runtime_getter = getattr(model, "_get_runtime", None)
+        if not callable(runtime_getter):
+            raise RuntimeError(
+                "Loaded VoxtralRealtime model is missing runtime loader. "
+                "Use mlx_audio.stt.load() compatible converted weights."
+            )
+
+        if needs_runtime_refresh and hasattr(model, "_runtime"):
+            setattr(model, "_runtime", None)
+
+        runtime = runtime_getter()
+        if isinstance(runtime, cls):
+            return runtime
+
+        tokenizer = getattr(model, "_tokenizer", None)
+        runtime_cfg = getattr(getattr(model, "config", None), "runtime", None)
+        if tokenizer is None or runtime_cfg is None:
+            raise RuntimeError("Voxtral runtime is missing tokenizer or runtime config")
+
+        runtime = cls(model=model, tokenizer=tokenizer, config=runtime_cfg)
+        if hasattr(model, "_runtime"):
+            setattr(model, "_runtime", runtime)
+        return runtime
 
     def transcribe(
         self,
@@ -358,20 +385,17 @@ class VoxtralRealtime:
             emitted, delta = _merge_stream_text(emitted, fallback_best_text)
             if delta:
                 yield delta
-        elif realtime_auto_fallback and accumulated_chunks:
-            full_audio = np.concatenate(accumulated_chunks)
-            out = self.transcribe(full_audio, language=language, max_tokens=max_tokens)
-            emitted, delta = _merge_stream_text(emitted, out.text)
-            if delta:
-                yield delta
-        elif not realtime_auto_fallback and accumulated_chunks:
-            raw_text = self.tokenizer.decode(
-                decoded_history, special_token_policy=self._decode_policy
-            )
-            raw_degenerate = _should_fallback_realtime(
-                recent_tokens, self._stream_control_token_ids
-            )
-            if raw_text.strip() and not raw_degenerate and len(raw_text.strip()) >= 16:
+        elif accumulated_chunks:
+            decode_fn = getattr(self.tokenizer, "decode", None)
+            raw_text = ""
+            if callable(decode_fn):
+                raw_text = decode_fn(
+                    decoded_history, special_token_policy=self._decode_policy
+                )
+
+            if _should_emit_realtime_text(
+                raw_text, recent_tokens, self._stream_control_token_ids
+            ):
                 emitted, delta = _merge_stream_text(emitted, raw_text)
                 if delta:
                     yield delta
@@ -693,38 +717,16 @@ class VoxtralRealtime:
 
 def load_tokenizer(model_id_or_path: str, revision: Optional[str]) -> MistralTokenizer:
     _require_mistral_common()
-    path = Path(model_id_or_path)
-    if path.exists():
-        for candidate in path.rglob("tekken*.json"):
-            return MistralTokenizer.from_file(str(candidate))
-        raise FileNotFoundError("No tekken*.json found in local model path")
-    return MistralTokenizer.from_hf_hub(model_id_or_path, revision=revision)
-
-
-def _load_or_convert_weights(
-    model_id_or_path: str,
-    cache_dir: Path,
-    revision: Optional[str],
-) -> Dict[str, mx.array]:
-    path = Path(model_id_or_path)
-    if path.exists():
-        return _load_safetensors(path)
-
-    snapshot_dir = snapshot_download(
+    model_path = get_model_path(
         model_id_or_path,
         revision=revision,
-        allow_patterns=["*.safetensors", "params.json", "config.json"],
+        allow_patterns=["tekken*.json", "tokenizer*.json", "config.json", "params.json"],
     )
-    return _load_safetensors(Path(snapshot_dir))
-
-
-def _load_safetensors(path: Path) -> Dict[str, mx.array]:
-    weights: Dict[str, mx.array] = {}
-    for file in sorted(path.glob("*.safetensors")):
-        arrays = mx.load(str(file))
-        for name, value in arrays.items():
-            weights[name] = value
-    return weights
+    for candidate in model_path.rglob("tekken*.json"):
+        return MistralTokenizer.from_file(str(candidate))
+    if Path(model_id_or_path).exists():
+        raise FileNotFoundError("No tekken*.json found in local model path")
+    return MistralTokenizer.from_hf_hub(model_id_or_path, revision=revision)
 
 
 def _maybe_cast_model(model: VoxtralModel, dtype: str) -> None:
@@ -827,6 +829,19 @@ def _merge_stream_text(existing: str, current: str) -> tuple[str, str]:
 
     merged = existing + current[overlap:]
     return merged, merged[len(existing) :]
+
+
+def _should_emit_realtime_text(
+    raw_text: str,
+    recent_tokens: List[int],
+    control_token_ids: set[int],
+) -> bool:
+    stripped = raw_text.strip()
+    if not stripped:
+        return False
+    if len(stripped) < 16:
+        return False
+    return not _should_fallback_realtime(recent_tokens, control_token_ids)
 
 
 def _should_fallback_realtime(recent_tokens: List[int], control_token_ids: set[int]) -> bool:

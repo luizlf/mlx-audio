@@ -41,18 +41,21 @@ class Model(VoxtralModel):
     def sample_rate(self) -> int:
         return int(self.config.audio_config.sampling_rate)
 
-    def _get_runtime(self) -> VoxtralRealtime:
-        if self._runtime is not None:
-            return self._runtime
+    def _build_runtime(self) -> VoxtralRealtime:
         if self._tokenizer is None:
             raise RuntimeError(
                 "Voxtral tokenizer not initialized. Use mlx_audio.stt.load() to load this model."
             )
-        self._runtime = VoxtralRealtime(
+        return VoxtralRealtime(
             model=self,
             tokenizer=self._tokenizer,
             config=self.config.runtime,
         )
+
+    def _get_runtime(self) -> VoxtralRealtime:
+        if self._runtime is not None:
+            return self._runtime
+        self._runtime = self._build_runtime()
         return self._runtime
 
     def sanitize(self, weights):
@@ -73,11 +76,7 @@ class Model(VoxtralModel):
     def post_load_hook(cls, model: "Model", model_path: Path) -> "Model":
         tokenizer = load_tokenizer(str(model_path), revision=None)
         model._tokenizer = tokenizer
-        model._runtime = VoxtralRealtime(
-            model=model,
-            tokenizer=tokenizer,
-            config=model.config.runtime,
-        )
+        model._runtime = model._build_runtime()
         return model
 
     @classmethod
