@@ -12,6 +12,10 @@ from huggingface_hub import hf_hub_download
 class TextConfig:
     data: Dict[str, Any]
 
+    @classmethod
+    def from_dict(cls, params: Dict[str, Any]) -> "TextConfig":
+        return cls(data=params.copy())
+
     @property
     def hidden_size(self) -> int:
         return int(self.data.get("hidden_size", self.data.get("dim")))
@@ -81,6 +85,10 @@ class TextConfig:
 @dataclass
 class AudioConfig:
     data: Dict[str, Any]
+
+    @classmethod
+    def from_dict(cls, params: Dict[str, Any]) -> "AudioConfig":
+        return cls(data=params.copy())
 
     @property
     def num_mel_bins(self) -> int:
@@ -171,8 +179,13 @@ class VoxtralConfig:
 
     @classmethod
     def from_dict(cls, cfg: Dict[str, Any]) -> "VoxtralConfig":
-        text_cfg, audio_cfg = _split_config(cfg)
-        return cls(text=TextConfig(text_cfg), audio=AudioConfig(audio_cfg), raw=cfg)
+        cfg_copy = cfg.copy()
+        text_cfg, audio_cfg = _split_config(cfg_copy)
+        return cls(
+            text=TextConfig.from_dict(text_cfg),
+            audio=AudioConfig.from_dict(audio_cfg),
+            raw=cfg_copy,
+        )
 
     @classmethod
     def from_pretrained(

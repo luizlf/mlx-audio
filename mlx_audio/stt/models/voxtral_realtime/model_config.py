@@ -8,13 +8,14 @@ from .config import AudioConfig, TextConfig, VoxtralConfig
 class ModelConfig:
     runtime: VoxtralConfig
     model_path: Optional[str] = None
+    model_type: str = "voxtral_realtime"
 
-    @property
-    def model_type(self) -> str:
-        model_type = str(self.runtime.raw.get("model_type", "voxtral_realtime"))
-        if model_type == "voxtral":
-            return "voxtral_realtime"
-        return model_type
+    def __post_init__(self) -> None:
+        if isinstance(self.runtime, dict):
+            self.runtime = VoxtralConfig.from_dict(self.runtime)
+        if not isinstance(self.runtime, VoxtralConfig):
+            raise TypeError("runtime must be a VoxtralConfig or a dict-like config payload")
+        self.model_type = str(self.model_type or "voxtral_realtime")
 
     @property
     def raw(self) -> Dict[str, Any]:
@@ -31,6 +32,23 @@ class ModelConfig:
     @classmethod
     def from_dict(cls, params: Dict[str, Any]) -> "ModelConfig":
         cfg = params.copy()
-        model_path = cfg.get("model_path")
-        runtime = VoxtralConfig.from_dict(cfg)
-        return cls(runtime=runtime, model_path=model_path)
+        runtime_cfg = cfg.pop("runtime", None)
+        model_path = cfg.pop("model_path", None)
+        if runtime_cfg is None:
+            runtime_cfg = cfg
+
+        model_type_value = cfg.get("model_type")
+        if model_type_value is None and isinstance(runtime_cfg, VoxtralConfig):
+            model_type_value = runtime_cfg.raw.get("model_type")
+        if model_type_value is None and isinstance(runtime_cfg, dict):
+            model_type_value = runtime_cfg.get("model_type")
+        model_type = str(model_type_value or "voxtral_realtime")
+
+        if isinstance(runtime_cfg, dict):
+            runtime = VoxtralConfig.from_dict(runtime_cfg.copy())
+        elif isinstance(runtime_cfg, VoxtralConfig):
+            runtime = runtime_cfg
+        else:
+            raise TypeError("runtime must be a VoxtralConfig or a dict-like config payload")
+
+        return cls(runtime=runtime, model_path=model_path, model_type=model_type)
