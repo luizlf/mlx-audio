@@ -161,17 +161,20 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         dict: Model configuration
 
     Raises:
-        FileNotFoundError: If config.json is not found at the path
+        FileNotFoundError: If neither config.json nor params.json is found at the path
     """
     if isinstance(model_path, str):
         model_path = get_model_path(model_path, **kwargs)
 
-    config_file = model_path / "config.json"
-    if config_file.exists():
-        with open(config_file, encoding="utf-8") as f:
-            return json.load(f)
-    else:
-        raise FileNotFoundError(f"Config not found at {model_path}")
+    for config_name in ("config.json", "params.json"):
+        config_file = model_path / config_name
+        if config_file.exists():
+            with open(config_file, encoding="utf-8") as f:
+                return json.load(f)
+
+    raise FileNotFoundError(
+        f"Config not found at {model_path} (expected config.json or params.json)"
+    )
 
 
 def load_weights(model_path: Path) -> dict:
@@ -313,6 +316,27 @@ def get_model_class(
     return arch, model_type
 
 
+def _should_force_voxtral_realtime_model_type(config: dict, category: str) -> bool:
+    if category != "stt":
+        return False
+    if str(config.get("model_type", "")).lower() != "voxtral":
+        return False
+    multimodal = config.get("multimodal")
+    if not isinstance(multimodal, dict):
+        return False
+    whisper_args = multimodal.get("whisper_model_args")
+    if not isinstance(whisper_args, dict):
+        return False
+    encoder_args = whisper_args.get("encoder_args")
+    if not isinstance(encoder_args, dict):
+        return False
+    audio_encoding_args = encoder_args.get("audio_encoding_args")
+    if not isinstance(audio_encoding_args, dict):
+        return False
+    transcription_format = audio_encoding_args.get("transcription_format")
+    return str(transcription_format or "").lower() == "streaming"
+
+
 def base_load_model(
     model_path: Union[str, Path],
     category: str,
@@ -355,6 +379,9 @@ def base_load_model(
         raise ValueError(f"Invalid model path type: {type(model_path)}")
 
     config = load_config(model_path)
+    if _should_force_voxtral_realtime_model_type(config, category):
+        config = dict(config)
+        config["model_type"] = "voxtral_realtime"
     config["model_path"] = str(model_path)
 
     # Determine model_type from config or model_name
