@@ -232,7 +232,7 @@ def _maybe_permute_rope(name: str, value: mx.array, text_cfg: TextConfig) -> mx.
 
 def _build_output_config(config: VoxtralConfig) -> Dict[str, Any]:
     output = dict(config.raw)
-    output["model_type"] = "voxtral"
+    output["model_type"] = "voxtral_realtime"
     return output
 
 
@@ -274,7 +274,7 @@ def _load_safetensors(path: Path) -> Dict[str, mx.array]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser("mlx_audio.stt.voxtral.converter")
+    parser = argparse.ArgumentParser("mlx_audio.stt.models.voxtral_realtime.converter")
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--revision", default=None)

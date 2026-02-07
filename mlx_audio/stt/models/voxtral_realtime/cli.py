@@ -17,7 +17,7 @@ def _load_audio(path: str, target_sr: int) -> np.ndarray:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser("mlx_audio.stt.voxtral")
+    parser = argparse.ArgumentParser("mlx_audio.stt.models.voxtral_realtime")
     parser.add_argument("--model", required=True, help="HF repo or local path")
     parser.add_argument("--audio", required=True, help="Path to audio file")
     parser.add_argument("--language", default="en")

@@ -6,11 +6,14 @@ import pytest
 
 pytest.importorskip("mistral_common")
 
-from mlx_audio.stt.models.voxtral.config import ModelConfig
-from mlx_audio.stt.voxtral import api as voxtral_api
-from mlx_audio.stt.voxtral.api import _replace_audio_placeholders, _should_fallback_realtime
-from mlx_audio.stt.voxtral.config import AudioConfig, TextConfig, VoxtralConfig
-from mlx_audio.stt.voxtral.converter import _build_output_config
+from mlx_audio.stt.models.voxtral_realtime import api as voxtral_api
+from mlx_audio.stt.models.voxtral_realtime.api import (
+    _replace_audio_placeholders,
+    _should_fallback_realtime,
+)
+from mlx_audio.stt.models.voxtral_realtime.config import AudioConfig, TextConfig, VoxtralConfig
+from mlx_audio.stt.models.voxtral_realtime.converter import _build_output_config
+from mlx_audio.stt.models.voxtral_realtime.model_config import ModelConfig
 
 
 def test_replace_audio_placeholders_replaces_only_audio_tokens() -> None:
@@ -255,7 +258,7 @@ def test_voxtral_config_from_multimodal_dict() -> None:
 
 def test_voxtral_config_remaps_legacy_split_audio_config() -> None:
     cfg = {
-        "model_type": "voxtral",
+        "model_type": "voxtral_realtime",
         "text_config": {
             "hidden_size": 3072,
             "num_hidden_layers": 30,
@@ -293,7 +296,7 @@ def test_converter_output_config_forces_voxtral_model_type() -> None:
     )
 
     out_cfg = _build_output_config(cfg)
-    assert out_cfg["model_type"] == "voxtral"
+    assert out_cfg["model_type"] == "voxtral_realtime"
     assert out_cfg["foo"] == "bar"
     assert cfg.raw["model_type"] == "mistral"
 
@@ -329,6 +332,6 @@ def test_model_config_wraps_runtime_config() -> None:
     }
 
     model_cfg = ModelConfig.from_dict(cfg)
-    assert model_cfg.model_type == "voxtral"
+    assert model_cfg.model_type == "voxtral_realtime"
     assert model_cfg.audio_config.num_mel_bins == 80
     assert model_cfg.text_config.hidden_size == 3072
