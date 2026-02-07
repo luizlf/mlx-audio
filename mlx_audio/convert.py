@@ -146,6 +146,7 @@ def _discover_detection_hints(domain: str) -> dict:
         "config_keys": {},  # model_type -> set of unique config keys
         "architectures": {},  # model_type -> set of architecture patterns
         "path_patterns": {},  # model_type -> set of path patterns
+        "aliases": {},  # alias -> canonical model_type
     }
 
     for model_type in get_model_types(Domain(domain)):
@@ -166,6 +167,9 @@ def _discover_detection_hints(domain: str) -> dict:
                     hints["path_patterns"][model_type] = set(
                         model_hints["path_patterns"]
                     )
+                if "aliases" in model_hints:
+                    for alias, target in model_hints["aliases"].items():
+                        hints["aliases"][alias.lower()] = target
             else:
                 # Infer from ModelConfig if available
                 if hasattr(module, "ModelConfig"):
@@ -225,22 +229,33 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
 
 def load_config(model_path: Path) -> dict:
     """Load model configuration from a path."""
-    config_path = model_path / "config.json"
-    if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    raise FileNotFoundError(f"Config not found at {model_path}")
+    for config_name in ("config.json", "params.json"):
+        config_path = model_path / config_name
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    raise FileNotFoundError(
+        f"Config not found at {model_path} (expected config.json or params.json)"
+    )
 
 
 def _match_by_model_type(model_type: str) -> Optional[Domain]:
     """Try to match a model_type string to a domain."""
     if not model_type:
         return None
+    model_type = model_type.lower()
 
     # Check each domain's known model types
     for domain in Domain:
         if model_type in get_model_types(domain):
             return domain
+        hints = get_detection_hints(domain)
+        alias_target = hints.get("aliases", {}).get(model_type)
+        if alias_target and alias_target in get_model_types(domain):
+            return domain
+        for patterns in hints.get("path_patterns", {}).values():
+            if any(model_type == pattern.lower() for pattern in patterns):
+                return domain
 
     return None
 
@@ -320,14 +335,23 @@ def get_model_type(config: dict, model_path: Path, domain: Domain) -> str:
     # Check both model_type and name fields
     model_type = config.get("model_type", "").lower()
     model_name = config.get("name", "").lower()
+    model_types = get_model_types(domain)
+    hints = get_detection_hints(domain)
 
     # Direct match via config (model_type takes precedence)
     for candidate in [model_type, model_name]:
-        if candidate and candidate in get_model_types(domain):
+        if not candidate:
+            continue
+        alias_target = hints.get("aliases", {}).get(candidate)
+        if alias_target and alias_target in model_types:
+            return alias_target
+        if candidate in model_types:
             return candidate
+        for mt, patterns in hints.get("path_patterns", {}).items():
+            if any(candidate == pattern.lower() for pattern in patterns):
+                return mt
 
     # Try config key matching within domain
-    hints = get_detection_hints(domain)
     config_keys = set(config.keys())
 
     best_match = None
@@ -351,7 +375,6 @@ def get_model_type(config: dict, model_path: Path, domain: Domain) -> str:
             return mt
 
     # Fallback: return first available model type or "unknown"
-    model_types = get_model_types(domain)
     return next(iter(model_types), "unknown") if model_types else "unknown"
 
 

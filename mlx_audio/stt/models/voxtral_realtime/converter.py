@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import argparse
-import json
 import re
-from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import mlx.core as mx
-from huggingface_hub import snapshot_download
 
 from .config import TextConfig, VoxtralConfig
 from .model import VoxtralModel
@@ -234,53 +230,3 @@ def _build_output_config(config: VoxtralConfig) -> Dict[str, Any]:
     output = dict(config.raw)
     output["model_type"] = "voxtral_realtime"
     return output
-
-
-def convert_to_mlx(model_id_or_path: str, output_dir: str, revision: str | None = None) -> Path:
-    config, _ = VoxtralConfig.from_pretrained(model_id_or_path, revision=revision)
-    model = VoxtralModel(config.text, config.audio)
-
-    weights = _load_raw_weights(model_id_or_path, revision)
-    weights = remap_weights(weights, text_cfg=config.text)
-    weights = align_weights(model, weights)
-
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    mx.save_safetensors(str(out / "model.safetensors"), weights)
-    with (out / "config.json").open("w", encoding="utf-8") as f:
-        json.dump(_build_output_config(config), f, indent=2)
-    return out
-
-
-def _load_raw_weights(model_id_or_path: str, revision: str | None) -> Dict[str, mx.array]:
-    path = Path(model_id_or_path)
-    if path.exists():
-        return _load_safetensors(path)
-    snapshot_dir = snapshot_download(
-        model_id_or_path,
-        revision=revision,
-        allow_patterns=["*.safetensors", "params.json", "config.json"],
-    )
-    return _load_safetensors(Path(snapshot_dir))
-
-
-def _load_safetensors(path: Path) -> Dict[str, mx.array]:
-    weights: Dict[str, mx.array] = {}
-    for file in sorted(path.glob("*.safetensors")):
-        arrays = mx.load(str(file))
-        for name, value in arrays.items():
-            weights[name] = value
-    return weights
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser("mlx_audio.stt.models.voxtral_realtime.converter")
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--revision", default=None)
-    args = parser.parse_args()
-    convert_to_mlx(args.model, args.output, revision=args.revision)
-
-
-if __name__ == "__main__":
-    main()
