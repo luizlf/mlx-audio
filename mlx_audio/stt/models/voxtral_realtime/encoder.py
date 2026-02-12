@@ -20,6 +20,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import EncoderConfig
+from .kv_cache import VoxtralSlidingWindowKVCache
 
 
 def _interleaved_rope(x, cos, sin, n_heads, head_dim):
@@ -215,28 +216,68 @@ class AudioEncoder(nn.Module):
         Yields:
             mx.array: [chunk_size, dim] encoded chunk
         """
-        from mlx_lm.models.cache import RotatingKVCache
-
         seq_len = conv_out.shape[0]
         sw = self.config.sliding_window
-        n_layers = len(self.transformer_layers)
-        caches = [RotatingKVCache(max_size=sw, keep=0) for _ in range(n_layers)]
+        chunk_size = int(sw)
+        caches = self.make_chunk_caches(chunk_size)
 
-        for chunk_start in range(0, seq_len, sw):
-            chunk_end = min(chunk_start + sw, seq_len)
+        for chunk_start in range(0, seq_len, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seq_len)
             x = conv_out[chunk_start:chunk_end]
-            chunk_len = x.shape[0]
+            chunk_len = int(x.shape[0])
+            if chunk_len < chunk_size:
+                x = mx.concatenate(
+                    [x, mx.zeros((chunk_size - chunk_len, x.shape[1]), dtype=x.dtype)],
+                    axis=0,
+                )
 
-            positions = mx.arange(chunk_start, chunk_end)
+            positions = mx.arange(chunk_start, chunk_start + chunk_size)
             rope_cos, rope_sin = _compute_rope_freqs(
                 positions, self.config.head_dim, self.config.rope_theta
             )
 
             for i, layer in enumerate(self.transformer_layers):
-                mask = caches[i].make_mask(chunk_len, window_size=sw)
+                mask = caches[i].make_mask(chunk_size, window_size=sw)
                 x = layer(x, rope_cos, rope_sin, mask, cache=caches[i])
 
-            yield self.transformer_norm(x)
+            yield self.transformer_norm(x)[:chunk_len]
+
+    def make_chunk_caches(self, chunk_size: int):
+        sw = int(self.config.sliding_window)
+        return [
+            VoxtralSlidingWindowKVCache(window_size=sw, chunk_size=int(chunk_size))
+            for _ in range(len(self.transformer_layers))
+        ]
+
+    def encode_incremental_chunk(self, conv_chunk, caches, chunk_start: int):
+        """Encode one conv chunk with persistent caches.
+
+        Args:
+            conv_chunk: [chunk_len, dim]
+            caches: list of VoxtralSlidingWindowKVCache (one per layer)
+            chunk_start: absolute conv-frame start index
+        """
+        if not caches:
+            raise ValueError("caches must be non-empty")
+        chunk_size = int(caches[0].chunk_size)
+        chunk_len = int(conv_chunk.shape[0])
+        x = conv_chunk
+        if chunk_len < chunk_size:
+            x = mx.concatenate(
+                [x, mx.zeros((chunk_size - chunk_len, x.shape[1]), dtype=x.dtype)],
+                axis=0,
+            )
+
+        positions = mx.arange(int(chunk_start), int(chunk_start) + chunk_size)
+        rope_cos, rope_sin = _compute_rope_freqs(
+            positions, self.config.head_dim, self.config.rope_theta
+        )
+        sw = int(self.config.sliding_window)
+        for i, layer in enumerate(self.transformer_layers):
+            mask = caches[i].make_mask(chunk_size, window_size=sw)
+            x = layer(x, rope_cos, rope_sin, mask, cache=caches[i])
+        x = self.transformer_norm(x)
+        return x[:chunk_len]
 
     def downsample_and_project(self, encoded):
         """4x downsample encoder output and project to decoder dim.
