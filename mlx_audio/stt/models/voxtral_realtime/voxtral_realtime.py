@@ -15,20 +15,39 @@ Optimizations:
 """
 
 import math
+import json
+import os
+import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Generator, Iterable, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
 from ..base import STTOutput
-from .audio import compute_mel_filters, compute_mel_spectrogram
+from .audio import StreamingBuffer, compute_mel_filters, compute_mel_spectrogram
 from .config import ModelConfig
 from .decoder import Decoder, compute_time_embedding
 from .encoder import AudioEncoder
 from .tokenizer import TekkenTokenizer
+
+try:
+    from mistral_common.audio import Audio
+    from mistral_common.protocol.transcription.request import (
+        RawAudio,
+        StreamingMode,
+        TranscriptionRequest,
+    )
+    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+except ImportError:
+    Audio = None
+    RawAudio = None
+    StreamingMode = None
+    TranscriptionRequest = None
+    MistralTokenizer = None
 
 # Derived streaming constants
 SAMPLE_RATE = 16000
@@ -65,6 +84,272 @@ def _pad_audio_streaming(audio_array, n_left_pad_tokens, n_right_pad_tokens):
     return np.pad(audio_array, (left_pad, right_pad))
 
 
+def _fit_audio_embeddings_to_slots(audio_embeds: mx.array, num_slots: int) -> mx.array:
+    slot_count = int(audio_embeds.shape[0])
+    if slot_count == num_slots:
+        return audio_embeds
+    if slot_count > num_slots:
+        return audio_embeds[:num_slots]
+    pad = num_slots - slot_count
+    return mx.concatenate(
+        [audio_embeds, mx.zeros((pad, audio_embeds.shape[-1]), dtype=audio_embeds.dtype)],
+        axis=0,
+    )
+
+
+def _load_mistral_tokenizer_compat(tekken_path: Path):
+    if MistralTokenizer is None:
+        return None
+    try:
+        return MistralTokenizer.from_file(str(tekken_path))
+    except TypeError:
+        payload = json.loads(tekken_path.read_text(encoding="utf-8"))
+        audio_cfg = payload.get("audio")
+        if not isinstance(audio_cfg, dict):
+            raise
+
+        allowed_keys = {
+            "sampling_rate",
+            "frame_rate",
+            "audio_encoding_config",
+            "chunk_length_s",
+            "transcription_delay_ms",
+            "transcription_format",
+        }
+        cleaned_audio = {k: v for k, v in audio_cfg.items() if k in allowed_keys}
+        if cleaned_audio == audio_cfg:
+            raise
+
+        payload["audio"] = cleaned_audio
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix="tekken.json",
+            delete=False,
+            encoding="utf-8",
+        ) as tmp:
+            json.dump(payload, tmp)
+            tmp_path = tmp.name
+        try:
+            return MistralTokenizer.from_file(tmp_path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+@dataclass(frozen=True)
+class RealtimeTokenEvent:
+    token_id: int
+    text: str
+
+
+@dataclass
+class _RealtimeSession:
+    model: "Model"
+    max_tokens: int
+    temperature: float
+    transcription_delay_ms: Optional[int]
+    realtime_chunk_multiple: int
+    buffer: StreamingBuffer
+    pending_chunk_remainder: np.ndarray = field(
+        default_factory=lambda: np.zeros((0,), dtype=np.float32)
+    )
+    stream_samples: int = 0
+    is_first_segment: bool = True
+    decoder_cache: Optional[List[tuple[mx.array, mx.array, int]]] = None
+    decoder_position: int = 0
+    last_token: Optional[int] = None
+    generated_total: int = 0
+    decoded_history: List[int] = field(default_factory=list)
+    emitted_text: str = ""
+    n_delay_tokens: int = 0
+    n_right_pad_tokens: int = 0
+    raw_audio_length_per_tok: int = int(RAW_AUDIO_LENGTH_PER_TOK)
+    downsample: int = 0
+    audio_position_frames: int = 0
+    audio_caches: Optional[list] = None
+    pending_conv: Optional[mx.array] = None
+
+    def __post_init__(self) -> None:
+        delay_ms = self.transcription_delay_ms or self.model.config.transcription_delay_ms
+        self.n_delay_tokens = _num_delay_tokens(delay_ms)
+        self.n_right_pad_tokens = int((self.n_delay_tokens + 1) + 10)
+        tokenizer = getattr(self.model, "_mistral_tokenizer", None)
+        if tokenizer is not None:
+            audio_encoder = tokenizer.instruct_tokenizer.audio_encoder
+            if audio_encoder is not None:
+                audio_cfg = audio_encoder.audio_config
+                self.n_delay_tokens = int(
+                    getattr(audio_cfg, "num_delay_tokens", self.n_delay_tokens)
+                )
+                self.n_right_pad_tokens = int(
+                    getattr(audio_cfg, "n_right_pad_tokens", self.n_right_pad_tokens)
+                )
+                self.raw_audio_length_per_tok = int(
+                    getattr(
+                        audio_cfg,
+                        "raw_audio_length_per_tok",
+                        self.raw_audio_length_per_tok,
+                    )
+                )
+        self.model._ensure_ada_scales(delay_ms)
+        self.downsample = int(self.model.encoder.config.downsample_factor)
+        self.audio_caches = self.model.encoder.make_chunk_caches(self.downsample)
+        self.pending_conv = mx.zeros((0, int(self.model.encoder.config.dim)), dtype=mx.float32)
+
+    @property
+    def exhausted(self) -> bool:
+        if self.last_token == int(self.model.config.eos_token_id):
+            return True
+        return self.max_tokens > 0 and self.generated_total >= self.max_tokens
+
+    def feed_chunk(self, chunk: np.ndarray) -> List[RealtimeTokenEvent]:
+        if self.exhausted:
+            return []
+        chunk_f32 = chunk.astype(np.float32)
+        if self.pending_chunk_remainder.size:
+            chunk_f32 = np.concatenate([self.pending_chunk_remainder, chunk_f32], axis=0)
+        usable = (len(chunk_f32) // self.realtime_chunk_multiple) * self.realtime_chunk_multiple
+        self.pending_chunk_remainder = chunk_f32[usable:]
+        if usable <= 0:
+            return []
+
+        self.buffer.write(chunk_f32[:usable])
+        self.stream_samples += int(usable)
+
+        out: List[RealtimeTokenEvent] = []
+        while (segment := self.buffer.read()) is not None:
+            out.extend(self._consume_segment(segment))
+            if self.exhausted:
+                break
+        return out
+
+    def flush(self) -> List[RealtimeTokenEvent]:
+        if self.exhausted:
+            return []
+
+        if self.pending_chunk_remainder.size:
+            pad = self.realtime_chunk_multiple - int(self.pending_chunk_remainder.size)
+            tail = np.pad(self.pending_chunk_remainder, (0, pad)).astype(np.float32)
+            self.pending_chunk_remainder = np.zeros((0,), dtype=np.float32)
+            self.buffer.write(tail)
+            self.stream_samples += int(tail.shape[0])
+
+        raw_len = int(self.raw_audio_length_per_tok)
+        right_tokens = int(self.n_right_pad_tokens)
+        align_pad = (raw_len - (self.stream_samples % raw_len)) % raw_len
+        total_pad = int(align_pad + raw_len * right_tokens)
+        if total_pad > 0:
+            mult = int(self.realtime_chunk_multiple)
+            if mult > 0 and total_pad % mult:
+                total_pad = ((total_pad + mult - 1) // mult) * mult
+            self.buffer.write(np.zeros((total_pad,), dtype=np.float32))
+            self.stream_samples += total_pad
+
+        out: List[RealtimeTokenEvent] = []
+        while (segment := self.buffer.read()) is not None:
+            out.extend(self._consume_segment(segment))
+            if self.exhausted:
+                break
+        return out
+
+    def _emit(self, token: int) -> RealtimeTokenEvent:
+        self.last_token = int(token)
+        self.generated_total += 1
+        self.decoded_history.append(int(token))
+        text_so_far = self.model._tokenizer.decode(
+            [t for t in self.decoded_history if t != self.model.config.eos_token_id]
+        )
+        if text_so_far.startswith(self.emitted_text):
+            delta = text_so_far[len(self.emitted_text) :]
+        else:
+            delta = text_so_far
+        self.emitted_text = text_so_far
+        return RealtimeTokenEvent(token_id=int(token), text=delta)
+
+    def _append_conv(self, audio_array: np.ndarray) -> None:
+        conv = self.model._encode_audio_to_conv(audio_array)
+        if int(conv.shape[0]) <= 0:
+            return
+        if self.pending_conv is None or int(self.pending_conv.shape[0]) == 0:
+            self.pending_conv = conv
+        else:
+            self.pending_conv = mx.concatenate([self.pending_conv, conv], axis=0)
+
+    def _next_audio_embed(self) -> Optional[mx.array]:
+        if self.pending_conv is None:
+            return None
+        if int(self.pending_conv.shape[0]) < self.downsample:
+            return None
+
+        chunk = self.pending_conv[: self.downsample]
+        self.pending_conv = self.pending_conv[self.downsample :]
+        encoded = self.model.encoder.encode_incremental_chunk(
+            chunk,
+            caches=self.audio_caches,
+            chunk_start=self.audio_position_frames,
+        )
+        self.audio_position_frames += self.downsample
+        adapted = self.model.encoder.downsample_and_project(encoded)
+        if int(adapted.shape[0]) <= 0:
+            return None
+        return adapted[0]
+
+    def _consume_segment(self, segment: np.ndarray) -> List[RealtimeTokenEvent]:
+        if self.exhausted:
+            return []
+
+        if self.is_first_segment:
+            prompt_ids_mx, prepared_audio = self.model._prepare_realtime_first_inputs(
+                segment
+            )
+            prompt_len = int(prompt_ids_mx.shape[0])
+            self._append_conv(prepared_audio)
+
+            audio_embeds: List[mx.array] = []
+            for _ in range(prompt_len):
+                emb = self._next_audio_embed()
+                if emb is None:
+                    break
+                audio_embeds.append(emb)
+            if len(audio_embeds) < prompt_len:
+                self.is_first_segment = False
+                return []
+            adapter_slots = mx.stack(audio_embeds, axis=0)
+
+            prompt_embeds = self.model.decoder.embed_tokens(prompt_ids_mx)
+            prefix_embeds = adapter_slots + prompt_embeds
+
+            h, self.decoder_cache = self.model.decoder.forward(prefix_embeds, start_pos=0, cache=None)
+            logits = self.model.decoder.logits(h[-1])
+            token = int(self.model._next_token_mx(logits, self.temperature).item())
+            self.decoder_position = prompt_len
+            self.is_first_segment = False
+            return [self._emit(token)]
+
+        if self.last_token is None:
+            return []
+
+        self._append_conv(segment)
+        audio_embed = self._next_audio_embed()
+        if audio_embed is None:
+            return []
+
+        token_embed = self.model.decoder.embed_token(int(self.last_token))
+        step_embed = token_embed + audio_embed
+
+        h, self.decoder_cache = self.model.decoder.forward(
+            step_embed[None, :],
+            start_pos=int(self.decoder_position),
+            cache=self.decoder_cache,
+        )
+        logits = self.model.decoder.logits(h.squeeze(0))
+        token = int(self.model._next_token_mx(logits, self.temperature).item())
+        self.decoder_position += 1
+        return [self._emit(token)]
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -75,6 +360,7 @@ class Model(nn.Module):
 
         # Will be set in post_load_hook
         self._tokenizer = None
+        self._mistral_tokenizer = None
         self._mel_filters = None
 
     def _ensure_mel_filters(self):
@@ -108,6 +394,38 @@ class Model(nn.Module):
             audio_input = audio_input[0]
         return np.array(audio_input).flatten().astype(np.float32)
 
+    def _prepare_realtime_first_inputs(
+        self, segment: np.ndarray
+    ) -> tuple[mx.array, np.ndarray]:
+        if (
+            self._mistral_tokenizer is None
+            or Audio is None
+            or RawAudio is None
+            or TranscriptionRequest is None
+            or StreamingMode is None
+        ):
+            raise RuntimeError(
+                "Realtime transcription requires mistral-common[audio]. "
+                "Install with: pip install 'mlx-audio[stt]'"
+            )
+
+        audio_obj = Audio(
+            segment.astype(np.float32),
+            int(self.config.audio_encoding_args.sampling_rate),
+            format="wav",
+        )
+        req = TranscriptionRequest(
+            model="voxtral",
+            audio=RawAudio.from_audio(audio_obj),
+            language=None,
+            streaming=StreamingMode.ONLINE,
+        )
+        tokenized = self._mistral_tokenizer.instruct_tokenizer.encode_transcription(req)
+        return (
+            mx.array(tokenized.tokens),
+            np.array(tokenized.audios[0].audio_array, dtype=np.float32),
+        )
+
     def _prepare_mel(self, audio_np, transcription_delay_ms=None):
         """Prepare mel spectrogram from audio numpy array."""
         delay_ms = transcription_delay_ms or self.config.transcription_delay_ms
@@ -132,6 +450,45 @@ class Model(nn.Module):
             mel = mel[:, 1:]
 
         return mel, n_delay
+
+    def _encode_segment_to_adapter(
+        self,
+        audio_np: np.ndarray,
+        *,
+        left_pad_tokens: int = 0,
+        right_pad_tokens: int = 0,
+    ) -> mx.array:
+        if left_pad_tokens or right_pad_tokens:
+            audio_np = _pad_audio_streaming(
+                audio_np,
+                int(left_pad_tokens),
+                int(right_pad_tokens),
+            )
+        conv_out = self._encode_audio_to_conv(audio_np)
+        if int(conv_out.shape[0]) <= 0:
+            return mx.zeros((0, int(self.config.decoder.dim)), dtype=mx.float32)
+
+        sw = int(self.encoder.config.sliding_window)
+        if int(conv_out.shape[0]) <= sw:
+            return self.encoder.encode_full(conv_out)
+
+        encoded = mx.concatenate(list(self.encoder.encode_chunks(conv_out)), axis=0)
+        return self.encoder.downsample_and_project(encoded)
+
+    def _encode_audio_to_conv(self, audio_np: np.ndarray) -> mx.array:
+        aec = self.config.audio_encoding_args
+        mel_filters = self._ensure_mel_filters()
+        audio_mx = mx.array(audio_np, dtype=mx.float32)
+        mel = compute_mel_spectrogram(
+            audio_mx,
+            mel_filters,
+            window_size=aec.window_size,
+            hop_length=aec.hop_length,
+            global_log_mel_max=aec.global_log_mel_max,
+        )
+        if mel.shape[1] % 2 != 0:
+            mel = mel[:, 1:]
+        return self.encoder.conv_stem(mel)
 
     def _ensure_ada_scales(self, transcription_delay_ms=None):
         """Ensure ada_scales match the given delay. Recomputes if needed."""
@@ -406,6 +763,128 @@ class Model(nn.Module):
 
         mx.clear_cache()
 
+    def stream_realtime_tokens(
+        self,
+        audio_iter: Iterable[np.ndarray],
+        *,
+        max_tokens: int = 0,
+        temperature: float = 0.0,
+        transcription_delay_ms: Optional[int] = None,
+    ) -> Generator[RealtimeTokenEvent, None, None]:
+        try:
+            if self._mistral_tokenizer is None:
+                raise RuntimeError(
+                    "Realtime transcription requires mistral-common[audio]. "
+                    "Install with: pip install 'mlx-audio[stt]'"
+                )
+            aec = self.config.audio_encoding_args
+            realtime_chunk_multiple = int(abs((int(aec.window_size) // 2) - int(aec.hop_length)))
+            if realtime_chunk_multiple <= 0:
+                raise ValueError("Realtime chunk multiple must be > 0")
+
+            sampling_rate = int(aec.sampling_rate)
+            frame_rate = float(aec.frame_rate)
+            delay_ms = float(
+                transcription_delay_ms
+                if transcription_delay_ms is not None
+                else self.config.transcription_delay_ms
+            )
+            look_ahead_ms = float(self.config.streaming_look_ahead_ms)
+            look_back_ms = float(self.config.streaming_look_back_ms)
+
+            tokenizer = getattr(self, "_mistral_tokenizer", None)
+            if tokenizer is not None:
+                audio_encoder = tokenizer.instruct_tokenizer.audio_encoder
+                if audio_encoder is not None:
+                    audio_cfg = audio_encoder.audio_config
+                    sampling_rate = int(getattr(audio_cfg, "sampling_rate", sampling_rate))
+                    frame_rate = float(getattr(audio_cfg, "frame_rate", frame_rate))
+                    delay_ms = float(getattr(audio_cfg, "transcription_delay_ms", delay_ms))
+                    look_ahead_ms = float(
+                        getattr(audio_cfg, "streaming_look_ahead_ms", look_ahead_ms)
+                    )
+                    look_back_ms = float(
+                        getattr(audio_cfg, "streaming_look_back_ms", look_back_ms)
+                    )
+
+            session = _RealtimeSession(
+                model=self,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                transcription_delay_ms=transcription_delay_ms,
+                realtime_chunk_multiple=realtime_chunk_multiple,
+                buffer=StreamingBuffer(
+                    sampling_rate=sampling_rate,
+                    frame_rate=frame_rate,
+                    transcription_delay_ms=delay_ms,
+                    streaming_look_ahead_ms=look_ahead_ms,
+                    streaming_look_back_ms=look_back_ms,
+                ),
+            )
+
+            for chunk in audio_iter:
+                for event in session.feed_chunk(chunk):
+                    yield event
+                if session.exhausted:
+                    break
+
+            if not session.exhausted:
+                for event in session.flush():
+                    yield event
+        finally:
+            mx.clear_cache()
+
+    def stream_realtime(
+        self,
+        audio_iter: Iterable[np.ndarray],
+        *,
+        max_tokens: int = 0,
+        temperature: float = 0.0,
+        transcription_delay_ms: Optional[int] = None,
+    ) -> Generator[str, None, None]:
+        for event in self.stream_realtime_tokens(
+            audio_iter,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            transcription_delay_ms=transcription_delay_ms,
+        ):
+            if event.text:
+                yield event.text
+
+    def transcribe_realtime(
+        self,
+        audio_iter: Iterable[np.ndarray],
+        *,
+        max_tokens: int = 0,
+        temperature: float = 0.0,
+        transcription_delay_ms: Optional[int] = None,
+    ) -> STTOutput:
+        start = time.time()
+        events = list(
+            self.stream_realtime_tokens(
+                audio_iter,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                transcription_delay_ms=transcription_delay_ms,
+            )
+        )
+        eos = int(self.config.eos_token_id)
+        generated = [int(event.token_id) for event in events if int(event.token_id) != eos]
+        text = self._tokenizer.decode(generated).strip()
+        total_time = max(time.time() - start, 1e-9)
+
+        delay_ms = transcription_delay_ms or self.config.transcription_delay_ms
+        prompt_tokens = int(1 + self.config.n_left_pad_tokens + _num_delay_tokens(delay_ms))
+        return STTOutput(
+            text=text,
+            prompt_tokens=prompt_tokens,
+            generation_tokens=len(generated),
+            total_tokens=prompt_tokens + len(generated),
+            total_time=total_time,
+            prompt_tps=prompt_tokens / total_time,
+            generation_tps=len(generated) / total_time,
+        )
+
     def _next_token_mx(self, logits, temperature):
         """Compute next token as lazy mx.array (for async eval pipelining)."""
         if temperature == 0:
@@ -520,6 +999,9 @@ class Model(nn.Module):
 
         # Load Tekken tokenizer
         model._tokenizer = TekkenTokenizer.from_model_path(model_path)
+        tekken_path = model_path / "tekken.json"
+        if MistralTokenizer is not None and tekken_path.exists():
+            model._mistral_tokenizer = _load_mistral_tokenizer_compat(tekken_path)
 
         # Precompute mel filters
         model._ensure_mel_filters()

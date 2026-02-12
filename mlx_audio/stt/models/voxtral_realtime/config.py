@@ -74,6 +74,8 @@ class ModelConfig(BaseModelArgs):
 
     # Streaming constants
     n_left_pad_tokens: int = 32
+    streaming_look_ahead_ms: float = 2.5
+    streaming_look_back_ms: float = 52.5
 
     def __post_init__(self):
         if isinstance(self.encoder_args, dict):
