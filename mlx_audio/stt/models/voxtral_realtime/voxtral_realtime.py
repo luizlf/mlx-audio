@@ -34,20 +34,8 @@ from .decoder import Decoder, compute_time_embedding
 from .encoder import AudioEncoder
 from .tokenizer import TekkenTokenizer
 
-try:
-    from mistral_common.audio import Audio
-    from mistral_common.protocol.transcription.request import (
-        RawAudio,
-        StreamingMode,
-        TranscriptionRequest,
-    )
-    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-except ImportError:
-    Audio = None
-    RawAudio = None
-    StreamingMode = None
-    TranscriptionRequest = None
-    MistralTokenizer = None
+_MISTRAL_COMMON = None
+_MISTRAL_COMMON_ATTEMPTED = False
 
 # Derived streaming constants
 SAMPLE_RATE = 16000
@@ -97,11 +85,36 @@ def _fit_audio_embeddings_to_slots(audio_embeds: mx.array, num_slots: int) -> mx
     )
 
 
-def _load_mistral_tokenizer_compat(tekken_path: Path):
-    if MistralTokenizer is None:
-        return None
+def _get_mistral_common():
+    global _MISTRAL_COMMON, _MISTRAL_COMMON_ATTEMPTED
+    if _MISTRAL_COMMON_ATTEMPTED:
+        return _MISTRAL_COMMON
+
+    _MISTRAL_COMMON_ATTEMPTED = True
     try:
-        return MistralTokenizer.from_file(str(tekken_path))
+        from mistral_common.audio import Audio
+        from mistral_common.protocol.transcription.request import (
+            RawAudio,
+            StreamingMode,
+            TranscriptionRequest,
+        )
+        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+    except ImportError:
+        _MISTRAL_COMMON = None
+    else:
+        _MISTRAL_COMMON = (
+            Audio,
+            RawAudio,
+            StreamingMode,
+            TranscriptionRequest,
+            MistralTokenizer,
+        )
+    return _MISTRAL_COMMON
+
+
+def _load_mistral_tokenizer_compat(tekken_path: Path, mistral_tokenizer_cls):
+    try:
+        return mistral_tokenizer_cls.from_file(str(tekken_path))
     except TypeError:
         payload = json.loads(tekken_path.read_text(encoding="utf-8"))
         audio_cfg = payload.get("audio")
@@ -130,7 +143,7 @@ def _load_mistral_tokenizer_compat(tekken_path: Path):
             json.dump(payload, tmp)
             tmp_path = tmp.name
         try:
-            return MistralTokenizer.from_file(tmp_path)
+            return mistral_tokenizer_cls.from_file(tmp_path)
         finally:
             try:
                 os.unlink(tmp_path)
@@ -170,6 +183,7 @@ class _RealtimeSession:
     audio_position_frames: int = 0
     audio_caches: Optional[list] = None
     pending_conv: Optional[mx.array] = None
+    right_pad_audio: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         delay_ms = self.transcription_delay_ms or self.model.config.transcription_delay_ms
@@ -193,6 +207,14 @@ class _RealtimeSession:
                         self.raw_audio_length_per_tok,
                     )
                 )
+                get_padding_audio = getattr(audio_encoder, "get_padding_audio", None)
+                if callable(get_padding_audio):
+                    _, right_pad = get_padding_audio()
+                    right_audio = np.array(
+                        getattr(right_pad, "audio_array", []), dtype=np.float32
+                    ).flatten()
+                    if right_audio.size > 0:
+                        self.right_pad_audio = right_audio
         self.model._ensure_ada_scales(delay_ms)
         self.downsample = int(self.model.encoder.config.downsample_factor)
         self.audio_caches = self.model.encoder.make_chunk_caches(self.downsample)
@@ -236,16 +258,20 @@ class _RealtimeSession:
             self.buffer.write(tail)
             self.stream_samples += int(tail.shape[0])
 
-        raw_len = int(self.raw_audio_length_per_tok)
-        right_tokens = int(self.n_right_pad_tokens)
-        align_pad = (raw_len - (self.stream_samples % raw_len)) % raw_len
-        total_pad = int(align_pad + raw_len * right_tokens)
-        if total_pad > 0:
-            mult = int(self.realtime_chunk_multiple)
-            if mult > 0 and total_pad % mult:
-                total_pad = ((total_pad + mult - 1) // mult) * mult
-            self.buffer.write(np.zeros((total_pad,), dtype=np.float32))
-            self.stream_samples += total_pad
+        if self.right_pad_audio is not None and int(self.right_pad_audio.size) > 0:
+            self.buffer.write(self.right_pad_audio)
+            self.stream_samples += int(self.right_pad_audio.shape[0])
+        else:
+            raw_len = int(self.raw_audio_length_per_tok)
+            right_tokens = int(self.n_right_pad_tokens)
+            align_pad = (raw_len - (self.stream_samples % raw_len)) % raw_len
+            total_pad = int(align_pad + raw_len * right_tokens)
+            if total_pad > 0:
+                mult = int(self.realtime_chunk_multiple)
+                if mult > 0 and total_pad % mult:
+                    total_pad = ((total_pad + mult - 1) // mult) * mult
+                self.buffer.write(np.zeros((total_pad,), dtype=np.float32))
+                self.stream_samples += total_pad
 
         out: List[RealtimeTokenEvent] = []
         while (segment := self.buffer.read()) is not None:
@@ -361,7 +387,25 @@ class Model(nn.Module):
         # Will be set in post_load_hook
         self._tokenizer = None
         self._mistral_tokenizer = None
+        self._mistral_tokenizer_path = None
         self._mel_filters = None
+
+    def _ensure_realtime_tokenizer(self):
+        if self._mistral_tokenizer is not None:
+            return self._mistral_tokenizer
+        if self._mistral_tokenizer_path is None:
+            return None
+
+        mistral_common = _get_mistral_common()
+        if mistral_common is None:
+            return None
+
+        mistral_tokenizer_cls = mistral_common[-1]
+        self._mistral_tokenizer = _load_mistral_tokenizer_compat(
+            Path(self._mistral_tokenizer_path),
+            mistral_tokenizer_cls,
+        )
+        return self._mistral_tokenizer
 
     def _ensure_mel_filters(self):
         if self._mel_filters is None:
@@ -397,17 +441,14 @@ class Model(nn.Module):
     def _prepare_realtime_first_inputs(
         self, segment: np.ndarray
     ) -> tuple[mx.array, np.ndarray]:
-        if (
-            self._mistral_tokenizer is None
-            or Audio is None
-            or RawAudio is None
-            or TranscriptionRequest is None
-            or StreamingMode is None
-        ):
+        tokenizer = self._ensure_realtime_tokenizer()
+        mistral_common = _get_mistral_common()
+        if tokenizer is None or mistral_common is None:
             raise RuntimeError(
                 "Realtime transcription requires mistral-common[audio]. "
                 "Install with: pip install 'mlx-audio[stt]'"
             )
+        Audio, RawAudio, StreamingMode, TranscriptionRequest, _ = mistral_common
 
         audio_obj = Audio(
             segment.astype(np.float32),
@@ -420,7 +461,36 @@ class Model(nn.Module):
             language=None,
             streaming=StreamingMode.ONLINE,
         )
-        tokenized = self._mistral_tokenizer.instruct_tokenizer.encode_transcription(req)
+        tokenized = tokenizer.instruct_tokenizer.encode_transcription(req)
+        return (
+            mx.array(tokenized.tokens),
+            np.array(tokenized.audios[0].audio_array, dtype=np.float32),
+        )
+
+    def _prepare_offline_inputs(
+        self, audio_np: np.ndarray, *, language: Optional[str] = None
+    ) -> tuple[mx.array, np.ndarray]:
+        tokenizer = self._ensure_realtime_tokenizer()
+        mistral_common = _get_mistral_common()
+        if tokenizer is None or mistral_common is None:
+            raise RuntimeError(
+                "Offline transcription requires mistral-common[audio]. "
+                "Install with: pip install 'mlx-audio[stt]'"
+            )
+
+        Audio, RawAudio, StreamingMode, TranscriptionRequest, _ = mistral_common
+        audio_obj = Audio(
+            audio_np.astype(np.float32),
+            int(self.config.audio_encoding_args.sampling_rate),
+            format="wav",
+        )
+        req = TranscriptionRequest(
+            model="voxtral",
+            audio=RawAudio.from_audio(audio_obj),
+            language=language,
+            streaming=StreamingMode.OFFLINE,
+        )
+        tokenized = tokenizer.instruct_tokenizer.encode_transcription(req)
         return (
             mx.array(tokenized.tokens),
             np.array(tokenized.audios[0].audio_array, dtype=np.float32),
@@ -517,16 +587,26 @@ class Model(nn.Module):
         """
         start_time = time.time()
 
-        self._ensure_ada_scales(transcription_delay_ms)
-        mel, n_delay = self._prepare_mel(audio_np, transcription_delay_ms)
+        if transcription_delay_ms is None:
+            self._ensure_ada_scales(None)
+            prompt_ids_mx, prepared_audio = self._prepare_offline_inputs(audio_np)
+            conv_out = self._encode_audio_to_conv(prepared_audio)
+            prompt_len = int(prompt_ids_mx.shape[0])
+        else:
+            self._ensure_ada_scales(transcription_delay_ms)
+            mel, n_delay = self._prepare_mel(audio_np, transcription_delay_ms)
+            conv_out = self.encoder.conv_stem(mel)
+            n_left = self.config.n_left_pad_tokens
+            prompt_len = 1 + n_left + n_delay
+            prompt_ids = [self.config.bos_token_id] + [
+                self.config.streaming_pad_token_id
+            ] * (n_left + n_delay)
+            prompt_ids_mx = mx.array(prompt_ids)
 
         # Run conv stem and compute total audio token count
-        conv_out = self.encoder.conv_stem(mel)
         ds = self.encoder.config.downsample_factor
         n_audio_total = conv_out.shape[0] // ds
 
-        n_left = self.config.n_left_pad_tokens
-        prompt_len = 1 + n_left + n_delay
         sw = self.encoder.config.sliding_window
 
         if conv_out.shape[0] <= sw:
@@ -561,11 +641,6 @@ class Model(nn.Module):
             print(f"Total audio tokens: {n_audio_total}")
 
         # Build prompt embeddings
-        prompt_ids = [self.config.bos_token_id] + [
-            self.config.streaming_pad_token_id
-        ] * (n_left + n_delay)
-
-        prompt_ids_mx = mx.array(prompt_ids)
         prompt_text_embeds = self.decoder.embed_tokens(prompt_ids_mx)
         prefix_embeds = adapter_out[:prompt_len] + prompt_text_embeds
 
@@ -772,7 +847,8 @@ class Model(nn.Module):
         transcription_delay_ms: Optional[int] = None,
     ) -> Generator[RealtimeTokenEvent, None, None]:
         try:
-            if self._mistral_tokenizer is None:
+            tokenizer = self._ensure_realtime_tokenizer()
+            if tokenizer is None:
                 raise RuntimeError(
                     "Realtime transcription requires mistral-common[audio]. "
                     "Install with: pip install 'mlx-audio[stt]'"
@@ -792,20 +868,18 @@ class Model(nn.Module):
             look_ahead_ms = float(self.config.streaming_look_ahead_ms)
             look_back_ms = float(self.config.streaming_look_back_ms)
 
-            tokenizer = getattr(self, "_mistral_tokenizer", None)
-            if tokenizer is not None:
-                audio_encoder = tokenizer.instruct_tokenizer.audio_encoder
-                if audio_encoder is not None:
-                    audio_cfg = audio_encoder.audio_config
-                    sampling_rate = int(getattr(audio_cfg, "sampling_rate", sampling_rate))
-                    frame_rate = float(getattr(audio_cfg, "frame_rate", frame_rate))
-                    delay_ms = float(getattr(audio_cfg, "transcription_delay_ms", delay_ms))
-                    look_ahead_ms = float(
-                        getattr(audio_cfg, "streaming_look_ahead_ms", look_ahead_ms)
-                    )
-                    look_back_ms = float(
-                        getattr(audio_cfg, "streaming_look_back_ms", look_back_ms)
-                    )
+            audio_encoder = tokenizer.instruct_tokenizer.audio_encoder
+            if audio_encoder is not None:
+                audio_cfg = audio_encoder.audio_config
+                sampling_rate = int(getattr(audio_cfg, "sampling_rate", sampling_rate))
+                frame_rate = float(getattr(audio_cfg, "frame_rate", frame_rate))
+                delay_ms = float(getattr(audio_cfg, "transcription_delay_ms", delay_ms))
+                look_ahead_ms = float(
+                    getattr(audio_cfg, "streaming_look_ahead_ms", look_ahead_ms)
+                )
+                look_back_ms = float(
+                    getattr(audio_cfg, "streaming_look_back_ms", look_back_ms)
+                )
 
             session = _RealtimeSession(
                 model=self,
@@ -1000,8 +1074,7 @@ class Model(nn.Module):
         # Load Tekken tokenizer
         model._tokenizer = TekkenTokenizer.from_model_path(model_path)
         tekken_path = model_path / "tekken.json"
-        if MistralTokenizer is not None and tekken_path.exists():
-            model._mistral_tokenizer = _load_mistral_tokenizer_compat(tekken_path)
+        model._mistral_tokenizer_path = tekken_path if tekken_path.exists() else None
 
         # Precompute mel filters
         model._ensure_mel_filters()
