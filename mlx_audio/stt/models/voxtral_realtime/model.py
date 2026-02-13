@@ -474,10 +474,14 @@ class VoxtralRealtimeAudioEncoder(nn.Module):
         return outputs
 
     def make_cache(self) -> List[Any]:
-        from mlx_lm.models import cache as lm_cache
+        from .kv_cache import VoxtralSlidingWindowKVCache
 
-        max_size = self.config.sliding_window or 750
-        return [lm_cache.RotatingKVCache(max_size=max_size, keep=0) for _ in self.layers]
+        window_size = int(self.config.sliding_window or 750)
+        chunk_size = int(self.config.downsample_factor)
+        return [
+            VoxtralSlidingWindowKVCache(window_size=window_size, chunk_size=chunk_size)
+            for _ in self.layers
+        ]
 
     def make_padding_cache(self) -> Conv1dPaddingCache:
         return Conv1dPaddingCache(self.conv1, self.conv2)

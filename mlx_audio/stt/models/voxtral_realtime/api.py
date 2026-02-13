@@ -357,7 +357,7 @@ class VoxtralRealtime:
                 audio_samples=int(audio_arrays[0].shape[0]),
                 conv_length=int(conv_features.shape[0]),
             )
-            tokens = self._generate_audio_conditioned(
+            tokens = self._generate_audio_conditioned_offline(
                 input_ids, conv_features=conv_features, max_tokens=max_tokens
             )
             text = self.tokenizer.decode(tokens, special_token_policy=self._decode_policy)
@@ -680,6 +680,162 @@ class VoxtralRealtime:
             logits = _model_logits(input_token, token_embed)
             token = int(mx.argmax(logits, axis=-1).item())
             position += 1
+
+        return generated
+
+    def _encode_audio_embeddings_offline(self, conv_features: mx.array) -> mx.array:
+        """Encode audio conv features into per-token decoder-dim embeddings.
+
+        This follows the vLLM/offline strategy: run the audio encoder transformer
+        on the full conv sequence (chunked when needed), then 4x downsample and
+        apply the adapter MLP once. This avoids per-token audio transformer calls
+        which are correct but much slower.
+        """
+        conv_len = int(conv_features.shape[0])
+        if conv_len <= 0:
+            return mx.zeros((0, int(self.config.text.hidden_size)), dtype=mx.float32)
+
+        downsample = int(self.config.audio.downsample_factor)
+        if downsample <= 0:
+            raise ValueError("downsample_factor must be > 0")
+
+        remainder = int(conv_len % downsample)
+        if remainder:
+            conv_features = conv_features[remainder:]
+            conv_len = int(conv_features.shape[0])
+
+        if conv_len <= 0:
+            return mx.zeros((0, int(self.config.text.hidden_size)), dtype=mx.float32)
+
+        sliding_window = int(self.config.audio.sliding_window or 750)
+        if sliding_window <= 0:
+            sliding_window = 750
+
+        if conv_len <= sliding_window:
+            encoded, _ = self.model.audio_encoder.forward_transformer(conv_features)
+            mx.eval(encoded)
+        else:
+            # Chunked transformer encoding with a sliding-window KV cache.
+            from .kv_cache import VoxtralSlidingWindowKVCache
+
+            chunk_size = sliding_window
+            caches = [
+                VoxtralSlidingWindowKVCache(window_size=sliding_window, chunk_size=chunk_size)
+                for _ in self.model.audio_encoder.layers
+            ]
+            encoded_chunks: List[mx.array] = []
+            dim = int(conv_features.shape[1])
+            for start in range(0, conv_len, chunk_size):
+                end = min(start + chunk_size, conv_len)
+                chunk = conv_features[start:end]
+                if int(chunk.shape[0]) < chunk_size:
+                    pad = chunk_size - int(chunk.shape[0])
+                    chunk = mx.concatenate(
+                        [chunk, mx.zeros((pad, dim), dtype=chunk.dtype)], axis=0
+                    )
+                out, _ = self.model.audio_encoder.forward_transformer(
+                    chunk,
+                    cache=caches,
+                    position_offset=0,
+                )
+                out = out[: end - start]
+                mx.eval(out)
+                encoded_chunks.append(out)
+
+            encoded = (
+                encoded_chunks[0]
+                if len(encoded_chunks) == 1
+                else mx.concatenate(encoded_chunks, axis=0)
+            )
+
+        n_audio = conv_len // downsample
+        # flatten [T, d_model] -> [T/4, d_model*4]
+        flat = encoded[: n_audio * downsample].reshape(n_audio, -1)
+        embeds = self.model.audio_language_adapter(flat)
+        mx.eval(embeds)
+        return embeds
+
+    def _generate_audio_conditioned_offline(
+        self,
+        prompt_ids: mx.array,
+        conv_features: mx.array,
+        max_tokens: int,
+    ) -> List[int]:
+        """Offline transcription path with vLLM-style audio pre-encoding."""
+        from mlx_lm.models import cache as lm_cache
+
+        prompt_len = int(prompt_ids.shape[0])
+        if prompt_len <= 0:
+            return []
+
+        audio_embeds = self._encode_audio_embeddings_offline(conv_features)
+        n_audio = int(audio_embeds.shape[0])
+        if n_audio <= 0:
+            return []
+
+        model_limit = max(n_audio - prompt_len + 1, 0)
+        if max_tokens <= 0:
+            max_tokens = model_limit
+        else:
+            max_tokens = min(int(max_tokens), model_limit)
+        if max_tokens <= 0:
+            return []
+
+        # Prefill prompt in one pass.
+        prompt_cache = lm_cache.make_prompt_cache(self.model)
+        t_cond = getattr(self.model, "_t_cond", None)
+
+        prompt_text_embeds = self.model.language_model.embed_input_ids(prompt_ids)
+        prefix_embeds = prompt_text_embeds + audio_embeds[:prompt_len]
+        hidden_states = self.model.language_model.model(
+            prompt_ids[None],
+            cache=prompt_cache,
+            input_embeddings=prefix_embeds[None],
+            t_cond=t_cond,
+        )
+        logits = self.model.language_model.model.embed_tokens.as_linear(
+            hidden_states[:, -1, :]
+        )
+        mx.eval(logits)
+
+        # Double-buffered async eval like upstream.
+        next_tok = mx.argmax(logits, axis=-1)
+        mx.async_eval(next_tok)
+
+        generated: List[int] = []
+        position = prompt_len
+
+        for step in range(max_tokens):
+            token = int(next_tok.item())
+            if token in self._eos_token_ids:
+                break
+            generated.append(token)
+
+            if step == max_tokens - 1:
+                break
+
+            if position >= n_audio:
+                break
+
+            input_token = mx.array([token], dtype=prompt_ids.dtype)
+            token_embed = self.model.language_model.embed_input_ids(input_token)
+            token_embed = token_embed + audio_embeds[position : position + 1]
+
+            hidden_states = self.model.language_model.model(
+                input_token[None],
+                cache=prompt_cache,
+                input_embeddings=token_embed[None],
+                t_cond=t_cond,
+            )
+            logits = self.model.language_model.model.embed_tokens.as_linear(
+                hidden_states[:, -1, :]
+            )
+            next_tok = mx.argmax(logits, axis=-1)
+            mx.async_eval(next_tok)
+            position += 1
+
+            if len(generated) % 256 == 0:
+                mx.clear_cache()
 
         return generated
 
